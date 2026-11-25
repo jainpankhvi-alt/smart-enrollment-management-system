@@ -1,0 +1,292 @@
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+
+  const sheet = e.range.getSheet();
+
+  // Only work on the Data entry sheet.
+  if (sheet.getName() !== "Data entry") return;
+
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+
+  // Data starts from row 6.
+  if (row < 6) return;
+
+  // Process one cell at a time.
+  if (
+    e.range.getNumRows() !== 1 ||
+    e.range.getNumColumns() !== 1
+  ) return;
+
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+
+  try {
+
+    // 1. Student Name entered in Column C.
+    if (col === 3 && e.value) {
+      createLeadDetails_(sheet, row);
+    }
+
+    // 2. Submit Lead checkbox checked in Column V.
+    if (
+      col === 22 &&
+      String(e.value).toUpperCase() === "TRUE"
+    ) {
+      submitLead_(sheet, row);
+    }
+
+  } catch (error) {
+    console.error(error);
+
+    if (col === 22) {
+      sheet.getRange(row, 23)
+        .setValue("Error: " + error.message);
+
+      sheet.getRange(row, 22).setValue(false);
+    }
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+// Generate Lead ID, Entry Date and Follow-up Date.
+function createLeadDetails_(sheet, row) {
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const studentName = sheet.getRange(row, 3).getValue();
+
+  if (!studentName) return;
+
+  const idCell = sheet.getRange(row, 1);
+  const dateCell = sheet.getRange(row, 2);
+  const followUpCell = sheet.getRange(row, 21);
+  const statusCell = sheet.getRange(row, 23);
+
+  // Generate unique Lead ID if blank.
+  if (!idCell.getValue()) {
+    const nextID = getNextLeadID_(ss);
+
+    idCell.setValue(
+      "WSC" + String(nextID).padStart(3, "0")
+    );
+  }
+
+  // Record Entry Date & Time only once.
+  if (!dateCell.getValue()) {
+    dateCell.setValue(new Date());
+    dateCell.setNumberFormat("dd-mmm-yyyy hh:mm:ss");
+  }
+
+  // Automatically set follow-up date two days later.
+  if (!followUpCell.getValue()) {
+    const entryDate = dateCell.getValue();
+    const followUpDate = new Date(entryDate);
+
+    followUpDate.setDate(followUpDate.getDate() + 2);
+
+    followUpCell.setValue(followUpDate);
+    followUpCell.setNumberFormat("dd-mmm-yyyy");
+  }
+
+  // Initial submission status.
+  if (!statusCell.getValue()) {
+    statusCell.setValue("Pending");
+  }
+}
+
+
+// Find the next available Lead ID.
+function getNextLeadID_(ss) {
+
+  const dataSheet = ss.getSheetByName("Data entry");
+  const mainSheet = ss.getSheetByName("Main datasheet");
+
+  let maxID = 0;
+
+  function checkIDs(sheet, startRow) {
+
+    if (!sheet || sheet.getLastRow() < startRow) return;
+
+    const ids = sheet.getRange(
+      startRow,
+      1,
+      sheet.getLastRow() - startRow + 1,
+      1
+    ).getDisplayValues();
+
+    ids.forEach(row => {
+
+      const match = String(row[0]).match(/^WSC(\d+)$/i);
+
+      if (match) {
+        maxID = Math.max(maxID, Number(match[1]));
+      }
+
+    });
+  }
+
+  checkIDs(dataSheet, 6);
+
+  // Main datasheet records start from row 8.
+  checkIDs(mainSheet, 8);
+
+  return maxID + 1;
+}
+
+
+// Find the first empty Lead ID row in Main datasheet.
+function getNextMainRow_(mainSheet) {
+
+  const startRow = 8;
+  const lastAvailableRow = mainSheet.getMaxRows();
+
+  const leadIDs = mainSheet.getRange(
+    startRow,
+    1,
+    lastAvailableRow - startRow + 1,
+    1
+  ).getDisplayValues();
+
+  const emptyIndex = leadIDs.findIndex(
+    row => String(row[0]).trim() === ""
+  );
+
+  if (emptyIndex !== -1) {
+    return startRow + emptyIndex;
+  }
+
+  // Add a new row if all existing rows are occupied.
+  mainSheet.insertRowAfter(lastAvailableRow);
+
+  return lastAvailableRow + 1;
+}
+
+
+// Submit lead to Main datasheet.
+function submitLead_(entrySheet, row) {
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mainSheet = ss.getSheetByName("Main datasheet");
+
+  const statusCell = entrySheet.getRange(row, 23);
+  const checkboxCell = entrySheet.getRange(row, 22);
+
+  if (!mainSheet) {
+    throw new Error("Main datasheet tab not found.");
+  }
+
+  // Prevent duplicate submissions.
+  if (statusCell.getValue() === "Submitted") {
+    checkboxCell.setValue(false);
+    return;
+  }
+
+  // Read Data Entry columns A to W.
+  const data = entrySheet.getRange(row, 1, 1, 23)
+    .getValues()[0];
+
+  const studentName = data[2];
+  const phone = data[3];
+  const course = data[7];
+  const counselor = data[9];
+
+  const enrollmentStatus = String(data[11] || "")
+    .trim()
+    .toLowerCase();
+
+  // Ensure automatic fields exist.
+  if (studentName) {
+    createLeadDetails_(entrySheet, row);
+
+    data[0] = entrySheet.getRange(row, 1).getValue();
+    data[1] = entrySheet.getRange(row, 2).getValue();
+    data[20] = entrySheet.getRange(row, 21).getValue();
+  }
+
+  // Not Interested leads are not transferred.
+  if (enrollmentStatus === "not interested") {
+
+    statusCell.setValue("Not Submitted - Not Interested");
+    checkboxCell.setValue(false);
+
+    return;
+  }
+
+  // Validate required fields.
+  const missing = [];
+
+  if (!studentName) missing.push("Student Name");
+  if (!phone) missing.push("Phone Number");
+  if (!course) missing.push("Course Name");
+  if (!counselor) missing.push("Counselor Name");
+  if (!enrollmentStatus) missing.push("Enrollment Status");
+
+  if (missing.length > 0) {
+
+    statusCell.setValue(
+      "Incomplete: " + missing.join(", ")
+    );
+
+    checkboxCell.setValue(false);
+
+    return;
+  }
+
+  // Determine whether the lead is open or closed.
+  const closedStatuses = [
+    "converted",
+    "enrolled"
+  ];
+
+  const leadStatus = closedStatuses.includes(enrollmentStatus)
+    ? "Closed"
+    : "Open";
+
+  // Prepare the 24 columns for Main datasheet.
+  const mainRow = [
+
+    data[0],        // A: Lead ID
+    data[1],        // B: Entry Date & Time
+    data[2],        // C: Student Name
+    data[3],        // D: Phone Number
+    data[4],        // E: Email
+    data[5],        // F: City
+    data[6],        // G: Lead Source
+    data[7],        // H: Course Name
+    data[8],        // I: Batch Code
+    data[9],        // J: Counselor Name
+    data[10],       // K: Call Status
+    data[11],       // L: Enrollment Status
+    leadStatus,     // M: Lead Status
+    data[12],       // N: Not Interested Reason
+    data[13],       // O: Total Fee
+    data[14],       // P: Fee Paid
+    data[15],       // Q: Payment Mode
+    data[16],       // R: EMI Start Date
+    data[17],       // S: EMI Amount
+    data[18],       // T: Total EMI Installments
+    data[19],       // U: Installments Paid
+    "",             // V: Next EMI Due Date
+    "",             // W: Last Follow-up Date
+    data[20]        // X: Next Follow-up Date
+
+  ];
+
+  // Find first empty row starting from row 8.
+  const targetRow = getNextMainRow_(mainSheet);
+
+  // Transfer all 24 columns.
+  mainSheet.getRange(targetRow, 1, 1, 24)
+    .setValues([mainRow]);
+
+  // Update submission status.
+  statusCell.setValue("Submitted");
+
+  // Reset checkbox after successful submission.
+  checkboxCell.setValue(false);
+}
